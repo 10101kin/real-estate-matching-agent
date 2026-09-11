@@ -1,0 +1,132 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  - name: deployEnabled
+    displayName: Enable Deploy Stage
+    type: boolean
+    default: false
+
+variables:
+  imageRepository: 'real-estate-event-registration-api'
+  containerRegistry: 'yourregistry.azurecr.io'
+  dockerfilePath: 'Dockerfile'
+  imageTag: '$(Build.SourceVersion)'
+  latestTag: 'latest'
+  appPort: '8000'
+  healthPath: '/health'
+  containerName: 'real-estate-event-registration-api-ci'
+  vmImage: 'ubuntu-latest'
+  acrServiceConnection: 'ACR_SERVICE_CONNECTION_NAME'
+  azureSubscriptionServiceConnection: 'AZURE_RM_SERVICE_CONNECTION_NAME'
+  webAppName: 'real-estate-event-registration-api'
+
+stages:
+  - stage: Verify
+    displayName: Verify Build, Test, and Container Health
+    jobs:
+      - job: VerifyJob
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.12'
+
+          - script: |
+              cd backend
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: Install backend dependencies
+
+          - script: |
+              cd backend
+              pytest -q
+            displayName: Run backend tests
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: Use Node.js 20
+
+          - script: |
+              cd frontend
+              npm ci
+              npm run build
+              test -s dist/index.html
+            displayName: Build frontend and verify dist output
+
+          - script: |
+              docker build -f $(dockerfilePath) -t $(imageRepository):$(imageTag) .
+            displayName: Build Docker image
+
+          - script: |
+              set -e
+              docker run -d --name $(containerName) -p $(appPort):$(appPort) $(imageRepository):$(imageTag)
+              for i in {1..30}; do
+                if curl -sf http://localhost:$(appPort)$(healthPath); then
+                  echo "Health check passed"
+                  break
+                fi
+                sleep 2
+              done
+              curl -sf http://localhost:$(appPort)/api/v1/events > /tmp/smoke-events.json
+            displayName: Runtime health and HTTP smoke test
+
+          - script: |
+              docker logs $(containerName) || true
+            displayName: Capture container logs on failure
+            condition: failed()
+
+          - script: |
+              docker rm -f $(containerName) || true
+            displayName: Cleanup container
+            condition: always()
+
+  - stage: Publish
+    displayName: Publish to Azure Container Registry
+    dependsOn: Verify
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: PublishImage
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+          - task: Docker@2
+            displayName: Build and push image to ACR
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(acrServiceConnection)
+              tags: |
+                $(imageTag)
+                $(latestTag)
+
+  - stage: Deploy
+    displayName: Deploy to Azure Web App for Containers
+    dependsOn: Publish
+    condition: and(succeeded(), eq('${{ parameters.deployEnabled }}', true))
+    jobs:
+      - deployment: DeployToAzure
+        environment: 'prod-real-estate-event-registration'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebAppContainer@1
+                  displayName: Deploy container to Azure Web App
+                  inputs:
+                    azureSubscription: $(azureSubscriptionServiceConnection)
+                    appName: $(webAppName)
+                    containers: '$(containerRegistry)/$(imageRepository):$(imageTag)'
